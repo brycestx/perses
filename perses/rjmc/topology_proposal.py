@@ -29,7 +29,21 @@ try:
 except ImportError:
     from commands import getoutput  # If python 2
 
+################################################################################
+# CONSTANTS
+################################################################################
+
+OESMILES_OPTIONS = oechem.OESMILESFlag_DEFAULT | oechem.OESMILESFlag_ISOMERIC | oechem.OESMILESFlag_Hydrogens
+
+################################################################################
+# LOGGER
+################################################################################
+
 _logger = logging.getLogger("proposal_engine")
+
+################################################################################
+# UTILITIES
+################################################################################
 
 def append_topology(destination_topology, source_topology, exclude_residue_name=None):
     """

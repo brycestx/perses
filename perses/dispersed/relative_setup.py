@@ -1,34 +1,36 @@
-from perses.distributed import feptasks
-from openmmtools.integrators import AlchemicalNonequilibriumLangevinIntegrator, LangevinIntegrator
-from openmmtools.states import ThermodynamicState, CompoundThermodynamicState, SamplerState
-import openmmtools.mcmc as mcmc
-import openmmtools.cache as cache
-import threading
+import copy
+import logging
 import queue
+import threading
+from io import StringIO
+
+import celery
+import mdtraj as md
+import numpy as np
+import openeye.oechem as oechem
 import openmmtools.alchemy as alchemy
+import openmmtools.mcmc as mcmc
 import pymbar
 import simtk.openmm as openmm
 import simtk.openmm.app as app
 import simtk.unit as unit
-import numpy as np
-from perses.tests.utils import createSystemFromIUPAC, get_data_filename, extractPositionsFromOEMOL
-from perses.annihilation.new_relative import HybridTopologyFactory
-from perses.rjmc.topology_proposal import TopologyProposal, TwoMoleculeSetProposalEngine, SystemGenerator, SmallMoleculeSetProposalEngine
-from perses.rjmc.geometry import FFAllAngleGeometryEngine
-import openeye.oechem as oechem
-import celery
-from openmoltools import forcefield_generators
-import copy
-import mdtraj as md
-import mdtraj.utils as mdtrajutils
-from io import StringIO
 from openmmtools.constants import kB
-import logging
-import os
-from perses.distributed.feptasks import NonequilibriumSwitchingMove
+from openmmtools.integrators import AlchemicalNonequilibriumLangevinIntegrator
+from openmmtools.states import ThermodynamicState, CompoundThermodynamicState, SamplerState
+from openmoltools import forcefield_generators
+from perses.dispersed import feptasks
+from perses.dispersed.feptasks import NonequilibriumSwitchingMove
+
+from perses.annihilation.new_relative import HybridTopologyFactory
+from perses.rjmc.geometry import FFAllAngleGeometryEngine
+from perses.rjmc.topology_proposal import TopologyProposal, TwoMoleculeSetProposalEngine, SystemGenerator
+from perses.tests.utils import extractPositionsFromOEMOL, get_data_filename
+
+
 work_lock = threading.Lock()
 
 _logger = logging.getLogger(__name__)
+
 
 class NonequilibriumFEPSetup(object):
     """
@@ -74,14 +76,16 @@ class NonequilibriumFEPSetup(object):
 
         self._old_ligand_positions = extractPositionsFromOEMOL(self._old_ligand_oemol)
 
-        ffxml=forcefield_generators.generateForceFieldFromMolecules([self._old_ligand_oemol, self._new_ligand_oemol])
+        ffxml = forcefield_generators.generateForceFieldFromMolecules([self._old_ligand_oemol, self._new_ligand_oemol])
 
         self._old_ligand_oemol.SetTitle("MOL")
         self._new_ligand_oemol.SetTitle("MOL")
 
-        self._new_ligand_smiles = oechem.OECreateSmiString(self._new_ligand_oemol, oechem.OESMILESFlag_DEFAULT | oechem.OESMILESFlag_Hydrogens)
-        #self._old_ligand_smiles = '[H]c1c(c(c(c(c1N([H])c2nc3c(c(n2)OC([H])([H])C4(C(C(C(C(C4([H])[H])([H])[H])([H])[H])([H])[H])([H])[H])[H])nc(n3[H])[H])[H])[H])S(=O)(=O)C([H])([H])[H])[H]'
-        self._old_ligand_smiles = oechem.OECreateSmiString(self._old_ligand_oemol, oechem.OESMILESFlag_DEFAULT | oechem.OESMILESFlag_Hydrogens)
+        self._new_ligand_smiles = oechem.OECreateSmiString(self._new_ligand_oemol,
+                                                           oechem.OESMILESFlag_DEFAULT | oechem.OESMILESFlag_Hydrogens)
+        # self._old_ligand_smiles = '[H]c1c(c(c(c(c1N([H])c2nc3c(c(n2)OC([H])([H])C4(C(C(C(C(C4([H])[H])([H])[H])([H])[H])([H])[H])([H])[H])[H])nc(n3[H])[H])[H])[H])S(=O)(=O)C([H])([H])[H])[H]'
+        self._old_ligand_smiles = oechem.OECreateSmiString(self._old_ligand_oemol,
+                                                           oechem.OESMILESFlag_DEFAULT | oechem.OESMILESFlag_Hydrogens)
 
         print(self._new_ligand_smiles)
         print(self._old_ligand_smiles)
@@ -91,8 +95,7 @@ class NonequilibriumFEPSetup(object):
         self._new_ligand_topology = forcefield_generators.generateTopologyFromOEMol(self._new_ligand_oemol)
         self._new_liands_md_topology = md.Topology.from_openmm(self._new_ligand_topology)
 
-
-        protein_pdbfile = open(self._protein_pdb_filename, 'r')
+        protein_pdbfile = open(self._protein_pdb_filename, 'r', encoding='latin-1')
         pdb_file = app.PDBFile(protein_pdbfile)
         protein_pdbfile.close()
 
@@ -116,26 +119,34 @@ class NonequilibriumFEPSetup(object):
 
         if pressure is not None:
             barostat = openmm.MonteCarloBarostat(self._pressure, self._temperature, self._barostat_period)
-            self._system_generator = SystemGenerator(forcefield_files, barostat=barostat, forcefield_kwargs={'nonbondedMethod' : app.PME})
+            self._system_generator = SystemGenerator(forcefield_files, barostat=barostat,
+                                                     forcefield_kwargs={'nonbondedMethod': app.PME})
         else:
             self._system_generator = SystemGenerator(forcefield_files)
 
-        #self._complex_proposal_engine = TwoMoleculeSetProposalEngine(self._old_ligand_smiles, self._new_ligand_smiles, self._system_generator, residue_name="MOL")
-        self._complex_proposal_engine = TwoMoleculeSetProposalEngine(self._old_ligand_oemol, self._new_ligand_oemol, self._system_generator, residue_name="MOL")
+        # self._complex_proposal_engine = TwoMoleculeSetProposalEngine(self._old_ligand_smiles, self._new_ligand_smiles, self._system_generator, residue_name="MOL")
+        self._complex_proposal_engine = TwoMoleculeSetProposalEngine(self._old_ligand_oemol, self._new_ligand_oemol,
+                                                                     self._system_generator, residue_name="MOL")
         self._geometry_engine = FFAllAngleGeometryEngine()
 
-        self._complex_topology_old_solvated, self._complex_positions_old_solvated, self._complex_system_old_solvated = self._solvate_system(self._complex_topology_old, self._complex_positions_old)
+        self._complex_topology_old_solvated, self._complex_positions_old_solvated, self._complex_system_old_solvated = self._solvate_system(
+            self._complex_topology_old, self._complex_positions_old)
         self._complex_md_topology_old_solvated = md.Topology.from_openmm(self._complex_topology_old_solvated)
         print(self._complex_proposal_engine._smiles_list)
 
         beta = 1.0 / (kB * temperature)
 
-        self._complex_topology_proposal = self._complex_proposal_engine.propose(self._complex_system_old_solvated, self._complex_topology_old_solvated)
-        self._complex_positions_new_solvated, _ = self._geometry_engine.propose(self._complex_topology_proposal, self._complex_positions_old_solvated, beta)
+        self._complex_topology_proposal = self._complex_proposal_engine.propose(self._complex_system_old_solvated,
+                                                                                self._complex_topology_old_solvated)
+        self._complex_positions_new_solvated, _ = self._geometry_engine.propose(self._complex_topology_proposal,
+                                                                                self._complex_positions_old_solvated,
+                                                                                beta)
 
-        #now generate the equivalent objects for the solvent phase. First, generate the ligand-only topologies and atom map
-        self._solvent_topology_proposal, self._old_solvent_positions = self._generate_ligand_only_topologies(self._complex_positions_old_solvated, self._complex_positions_new_solvated)
-        self._new_solvent_positions, _ = self._geometry_engine.propose(self._solvent_topology_proposal, self._old_solvent_positions, beta)
+        # now generate the equivalent objects for the solvent phase. First, generate the ligand-only topologies and atom map
+        self._solvent_topology_proposal, self._old_solvent_positions = self._generate_ligand_only_topologies(
+            self._complex_positions_old_solvated, self._complex_positions_new_solvated)
+        self._new_solvent_positions, _ = self._geometry_engine.propose(self._solvent_topology_proposal,
+                                                                       self._old_solvent_positions, beta)
 
     def load_sdf(self, sdf_filename, index=0):
         """
@@ -155,9 +166,9 @@ class NonequilibriumFEPSetup(object):
         """
         ifs = oechem.oemolistream()
         ifs.open(sdf_filename)
-        #get the list of molecules
+        # get the list of molecules
         mol_list = [oechem.OEMol(mol) for mol in ifs.GetOEMols()]
-        #we'll always take the first for now
+        # we'll always take the first for now
         mol_to_return = mol_list[index]
         return mol_to_return
 
@@ -228,55 +239,58 @@ class NonequilibriumFEPSetup(object):
         new_mol_start_index, new_mol_len = self._complex_proposal_engine._find_mol_start_index(new_complex.to_openmm())
 
         old_pos = unit.Quantity(np.zeros([len(old_positions), 3]), unit=unit.nanometers)
-        old_pos[:,:] = old_positions
-        old_ligand_positions = old_pos[old_mol_start_index:(old_mol_start_index+old_mol_len), :]
-        new_ligand_positions = new_positions[new_mol_start_index:(new_mol_start_index+new_mol_len), :]
+        old_pos[:, :] = old_positions
+        old_ligand_positions = old_pos[old_mol_start_index:(old_mol_start_index + old_mol_len), :]
+        new_ligand_positions = new_positions[new_mol_start_index:(new_mol_start_index + new_mol_len), :]
 
-        #atom_map_adjusted = {}
+        # atom_map_adjusted = {}
 
-        #loop through the atoms in the map. If the old index is creater than the old_mol_start_index but less than that
-        #plus the old mol length, then it is valid to include its adjusted value in the map.
-        #for old_idx, new_idx in complex_atom_map.items():
+        # loop through the atoms in the map. If the old index is creater than the old_mol_start_index but less than that
+        # plus the old mol length, then it is valid to include its adjusted value in the map.
+        # for old_idx, new_idx in complex_atom_map.items():
         #    if old_idx > old_mol_start_index and old_idx < old_mol_len + old_mol_start_index:
         #        atom_map_adjusted[old_idx - old_mol_len] = new_idx - new_mol_start_index
 
-        #subset the topologies:
+        # subset the topologies:
 
         old_ligand_topology = old_complex.subset(old_complex.select("resname == 'MOL' "))
         new_ligand_topology = new_complex.subset(new_complex.select("resname == 'MOL' "))
 
-        #solvate the old ligand topology:
-        old_solvated_topology, old_solvated_positions, old_solvated_system = self._solvate_system(old_ligand_topology.to_openmm(), old_ligand_positions)
+        # solvate the old ligand topology:
+        old_solvated_topology, old_solvated_positions, old_solvated_system = self._solvate_system(
+            old_ligand_topology.to_openmm(), old_ligand_positions)
 
         old_solvated_md_topology = md.Topology.from_openmm(old_solvated_topology)
 
-        #now remove the old ligand, leaving only the solvent
+        # now remove the old ligand, leaving only the solvent
         solvent_only_topology = old_solvated_md_topology.subset(old_solvated_md_topology.select("water"))
 
-        #append the solvent to the new ligand-only topology:
+        # append the solvent to the new ligand-only topology:
         new_solvated_ligand_md_topology = new_ligand_topology.join(solvent_only_topology)
-        nsl,b = new_solvated_ligand_md_topology.to_dataframe()
-        #dirty hack because new_solvated_ligand_md_topology.to_openmm() was throwing bond topology error
-        new_solvated_ligand_md_topology = md.Topology.from_dataframe(nsl,b)
+        nsl, b = new_solvated_ligand_md_topology.to_dataframe()
+        # dirty hack because new_solvated_ligand_md_topology.to_openmm() was throwing bond topology error
+        new_solvated_ligand_md_topology = md.Topology.from_dataframe(nsl, b)
 
         new_solvated_ligand_omm_topology = new_solvated_ligand_md_topology.to_openmm()
         new_solvated_ligand_omm_topology.setPeriodicBoxVectors(old_solvated_topology.getPeriodicBoxVectors())
 
-        #create the new ligand system:
+        # create the new ligand system:
         new_solvated_system = self._system_generator.build_system(new_solvated_ligand_omm_topology)
 
-        new_to_old_atom_map = {complex_atom_map[x]-new_mol_start_index:x-old_mol_start_index for x in old_complex.select("resname == 'MOL' ") if x in complex_atom_map.keys()}
-        #adjust the atom map to account for the presence of solvent degrees of freedom:
-        #By design, all atoms after the ligands are water, and should be mapped.
+        new_to_old_atom_map = {complex_atom_map[x] - new_mol_start_index: x - old_mol_start_index for x in
+                               old_complex.select("resname == 'MOL' ") if x in complex_atom_map.keys()}
+        # adjust the atom map to account for the presence of solvent degrees of freedom:
+        # By design, all atoms after the ligands are water, and should be mapped.
         n_water_atoms = solvent_only_topology.to_openmm().getNumAtoms()
         for i in range(n_water_atoms):
-            new_to_old_atom_map[new_mol_len+i] = old_mol_len + i
+            new_to_old_atom_map[new_mol_len + i] = old_mol_len + i
 
-        #change the map to accomodate the TP:
-        #new_to_old_atom_map = {value : key for key, value in atom_map_adjusted.items()}
+        # change the map to accomodate the TP:
+        # new_to_old_atom_map = {value : key for key, value in atom_map_adjusted.items()}
 
-        #make a TopologyProposal
-        ligand_topology_proposal = TopologyProposal(new_topology=new_solvated_ligand_omm_topology, new_system=new_solvated_system,
+        # make a TopologyProposal
+        ligand_topology_proposal = TopologyProposal(new_topology=new_solvated_ligand_omm_topology,
+                                                    new_system=new_solvated_system,
                                                     old_topology=old_solvated_topology, old_system=old_solvated_system,
                                                     new_to_old_atom_map=new_to_old_atom_map, old_chemical_state_key='A',
                                                     new_chemical_state_key='B')
@@ -286,21 +300,27 @@ class NonequilibriumFEPSetup(object):
     @property
     def complex_topology_proposal(self):
         return self._complex_topology_proposal
+
     @property
     def complex_old_positions(self):
         return self._complex_positions_old_solvated
+
     @property
     def complex_new_positions(self):
         return self._complex_positions_new_solvated
+
     @property
     def solvent_topology_proposal(self):
         return self._solvent_topology_proposal
+
     @property
     def solvent_old_positions(self):
         return self._old_solvent_positions
+
     @property
     def solvent_new_positions(self):
         return self._new_solvent_positions
+
 
 class NonequilibriumSwitchingFEP(object):
     """
@@ -308,16 +328,17 @@ class NonequilibriumSwitchingFEP(object):
     """
 
     default_forward_functions = {
-        'lambda_sterics' : 'lambda',
-        'lambda_electrostatics' : 'lambda',
-        'lambda_bonds' : 'lambda',
-        'lambda_angles' : 'lambda',
-        'lambda_torsions' : 'lambda'
+        'lambda_sterics': 'lambda',
+        'lambda_electrostatics': 'lambda',
+        'lambda_bonds': 'lambda',
+        'lambda_angles': 'lambda',
+        'lambda_torsions': 'lambda'
     }
 
     def __init__(self, topology_proposal, pos_old, new_positions, use_dispersion_correction=False,
                  forward_functions=None, ncmc_nsteps=100, nsteps_per_iteration=1,
-                 temperature=300.0 * unit.kelvin, trajectory_directory=None, trajectory_prefix=None, atom_selection="not water"):
+                 temperature=300.0 * unit.kelvin, trajectory_directory=None, trajectory_prefix=None,
+                 atom_selection="not water"):
         """
         Create an instance of the NonequilibriumSwitchingFEP driver class
 
@@ -348,19 +369,21 @@ class NonequilibriumSwitchingFEP(object):
             all water.
         """
 
-        #construct the hybrid topology factory object
-        self._factory = HybridTopologyFactory(topology_proposal, pos_old, new_positions, use_dispersion_correction=use_dispersion_correction)
+        # construct the hybrid topology factory object
+        self._factory = HybridTopologyFactory(topology_proposal, pos_old, new_positions,
+                                              use_dispersion_correction=use_dispersion_correction)
 
-        #use default functions if none specified
+        # use default functions if none specified
         if forward_functions == None:
             self._forward_functions = self.default_forward_functions
         else:
             self._forward_functions = forward_functions
 
-        #reverse functions to get a symmetric protocol
-        self._reverse_functions = {param : param_formula.replace("lambda", "(1-lambda)") for param, param_formula in self._forward_functions.items()}
+        # reverse functions to get a symmetric protocol
+        self._reverse_functions = {param: param_formula.replace("lambda", "(1-lambda)") for param, param_formula in
+                                   self._forward_functions.items()}
 
-        #set up some class attributes
+        # set up some class attributes
         self._hybrid_system = self._factory.hybrid_system
         self._initial_hybrid_positions = self._factory.hybrid_positions
         self._ncmc_nsteps = ncmc_nsteps
@@ -374,67 +397,85 @@ class NonequilibriumSwitchingFEP(object):
 
         if self._trajectory_directory and self._trajectory_prefix:
             self._write_traj = True
-            self._trajectory_filename = {lambda_state: os.path.join(self._trajectory_directory, trajectory_prefix+"lambda%d" % lambda_state + ".h5") for lambda_state in [0,1]}
-            self._neq_traj_filename = {lambda_state: os.path.join(self._trajectory_directory, trajectory_prefix + ".{iteration}.neq.lambda%d" % lambda_state + ".h5") for lambda_state in [0,1]}
+            self._trajectory_filename = {lambda_state: os.path.join(self._trajectory_directory,
+                                                                    trajectory_prefix + "lambda%d" % lambda_state + ".h5")
+                                         for lambda_state in [0, 1]}
+            self._neq_traj_filename = {lambda_state: os.path.join(self._trajectory_directory,
+                                                                  trajectory_prefix + ".{iteration}.neq.lambda%d" % lambda_state + ".h5")
+                                       for lambda_state in [0, 1]}
         else:
             self._write_traj = False
             self._trajectory_filename = {0: None, 1: None}
             self._neq_traj_filename = {0: None, 1: None}
 
         self._task_queue = queue.Queue()
-        #initialize lists for results
-        self._total_work = {0 : [], 1 : []}
-        self._reduced_potential_differences = {0 : [], 1 : []}
+        # initialize lists for results
+        self._total_work = {0: [], 1: []}
+        self._reduced_potential_differences = {0: [], 1: []}
 
-
-        #Set the number of times that the nonequilbrium move will have to be run in order to complete a protocol:
+        # Set the number of times that the nonequilbrium move will have to be run in order to complete a protocol:
         if self._ncmc_nsteps % self._nsteps_per_iteration != 0:
-            logging.warning("The number of ncmc steps is not divisible by the number of steps per iteration. You may not have a full protocol.")
+            logging.warning(
+                "The number of ncmc steps is not divisible by the number of steps per iteration. You may not have a full protocol.")
         self._n_iterations_per_call = self._ncmc_nsteps // self._nsteps_per_iteration
 
-        #create the thermodynamic state
+        # create the thermodynamic state
         lambda_zero_alchemical_state = alchemy.AlchemicalState.from_system(self._hybrid_system)
         lambda_one_alchemical_state = copy.deepcopy(lambda_zero_alchemical_state)
 
         lambda_zero_alchemical_state.set_alchemical_parameters(0.0)
         lambda_one_alchemical_state.set_alchemical_parameters(1.0)
 
-        #ensure their states are set appropriately
-        self._hybrid_alchemical_states = {0 : lambda_zero_alchemical_state, 1: lambda_one_alchemical_state}
+        # ensure their states are set appropriately
+        self._hybrid_alchemical_states = {0: lambda_zero_alchemical_state, 1: lambda_one_alchemical_state}
 
-        #create the base thermodynamic state with the hybrid system
+        # create the base thermodynamic state with the hybrid system
         self._thermodynamic_state = ThermodynamicState(self._hybrid_system, temperature=temperature)
 
-        #Create thermodynamic states for the nonalchemical endpoints
-        self._nonalchemical_thermodynamic_states = {0 : ThermodynamicState(topology_proposal.old_system, temperature=temperature), 1: ThermodynamicState(topology_proposal.new_system, temperature=temperature)}
+        # Create thermodynamic states for the nonalchemical endpoints
+        self._nonalchemical_thermodynamic_states = {
+            0: ThermodynamicState(topology_proposal.old_system, temperature=temperature),
+            1: ThermodynamicState(topology_proposal.new_system, temperature=temperature)}
 
-        #Now create the compound states with different alchemical states
-        self._hybrid_thermodynamic_states = {0: CompoundThermodynamicState(self._thermodynamic_state, composable_states=[self._hybrid_alchemical_states[0]]), 1: CompoundThermodynamicState(self._thermodynamic_state, composable_states=[self._hybrid_alchemical_states[1]])}
+        # Now create the compound states with different alchemical states
+        self._hybrid_thermodynamic_states = {0: CompoundThermodynamicState(self._thermodynamic_state,
+                                                                           composable_states=[
+                                                                               self._hybrid_alchemical_states[0]]),
+                                             1: CompoundThermodynamicState(self._thermodynamic_state,
+                                                                           composable_states=[
+                                                                               self._hybrid_alchemical_states[1]])}
 
-        #create the forward and reverse integrators
-        self._integrators = {0 : AlchemicalNonequilibriumLangevinIntegrator(alchemical_functions=self._forward_functions, nsteps_neq=ncmc_nsteps, temperature=temperature),
-                             1: AlchemicalNonequilibriumLangevinIntegrator(alchemical_functions=self._reverse_functions, nsteps_neq=ncmc_nsteps, temperature=temperature)}
+        # create the forward and reverse integrators
+        self._integrators = {0: AlchemicalNonequilibriumLangevinIntegrator(alchemical_functions=self._forward_functions,
+                                                                           nsteps_neq=ncmc_nsteps,
+                                                                           temperature=temperature),
+                             1: AlchemicalNonequilibriumLangevinIntegrator(alchemical_functions=self._reverse_functions,
+                                                                           nsteps_neq=ncmc_nsteps,
+                                                                           temperature=temperature)}
 
-        #create the forward and reverse MCMoves
-        self._ne_mc_moves = {n : NonequilibriumSwitchingMove(self._integrators[n], self._nsteps_per_iteration) for n in (0,1)}
+        # create the forward and reverse MCMoves
+        self._ne_mc_moves = {n: NonequilibriumSwitchingMove(self._integrators[n], self._nsteps_per_iteration) for n in
+                             (0, 1)}
 
-        #create the equilibrium MCMove
+        # create the equilibrium MCMove
         self._equilibrium_mc_move = mcmc.LangevinSplittingDynamicsMove()
 
-        #set the SamplerState for the lambda 0 and 1 equilibrium simulations
-        self._lambda_one_sampler_state = SamplerState(self._initial_hybrid_positions, box_vectors=self._hybrid_system.getDefaultPeriodicBoxVectors())
+        # set the SamplerState for the lambda 0 and 1 equilibrium simulations
+        self._lambda_one_sampler_state = SamplerState(self._initial_hybrid_positions,
+                                                      box_vectors=self._hybrid_system.getDefaultPeriodicBoxVectors())
         self._lambda_zero_sampler_state = copy.deepcopy(self._lambda_one_sampler_state)
 
-        self._sampler_states = {0: SamplerState(self._initial_hybrid_positions, box_vectors=self._hybrid_system.getDefaultPeriodicBoxVectors()),
+        self._sampler_states = {0: SamplerState(self._initial_hybrid_positions,
+                                                box_vectors=self._hybrid_system.getDefaultPeriodicBoxVectors()),
                                 1: copy.deepcopy(self._lambda_one_sampler_state)}
 
         self._listener_thread = threading.Thread(target=self._record_switching_results, daemon=True)
         self._listener_thread.start()
 
-        #initialize by minimizing
+        # initialize by minimizing
         self.minimize()
 
-        #subset the topology appropriately:
+        # subset the topology appropriately:
         if atom_selection is not None:
             atom_selection_indices = self._factory.hybrid_topology.select(atom_selection)
             self._atom_selection_indices = atom_selection_indices
@@ -452,9 +493,11 @@ class NonequilibriumSwitchingFEP(object):
         max_steps : int, default 50
             max number of steps for openmm minimizer.
         """
-        minimized_results = {n: feptasks.minimize.delay(self._hybrid_thermodynamic_states[n], self._sampler_states[n], self._equilibrium_mc_move, max_iterations=max_steps) for n in (0,1)}
+        minimized_results = {n: feptasks.minimize.delay(self._hybrid_thermodynamic_states[n], self._sampler_states[n],
+                                                        self._equilibrium_mc_move, max_iterations=max_steps) for n in
+                             (0, 1)}
         _logger.info("Minimizing")
-        self._sampler_states ={n: result.get() for (n, result) in minimized_results.items()}
+        self._sampler_states = {n: result.get() for (n, result) in minimized_results.items()}
 
     def run(self, n_iterations=5):
         """
@@ -473,13 +516,13 @@ class NonequilibriumSwitchingFEP(object):
         for i in range(n_iterations):
             iteration_chords = dict()
             iteration_results = dict()
-            for lambda_state in [0,1]:
-
+            for lambda_state in [0, 1]:
                 eq_traj_file = self._trajectory_filename[lambda_state] if self._write_traj else None
-                neq_traj_file = self._neq_traj_filename[lambda_state].format(teration=self._current_iteration) if self._write_traj else None
+                neq_traj_file = self._neq_traj_filename[lambda_state].format(
+                    teration=self._current_iteration) if self._write_traj else None
 
                 initial_equilibrium_result = feptasks.EquilibriumResult(self._sampler_states[lambda_state], 0.0)
-                #the first task is an equilibrium task:
+                # the first task is an equilibrium task:
                 equilibrium_task = feptasks.run_equilibrium.s(initial_equilibrium_result,
                                                               self._hybrid_thermodynamic_states[lambda_state],
                                                               self._equilibrium_mc_move, self._factory.hybrid_topology,
@@ -487,8 +530,8 @@ class NonequilibriumSwitchingFEP(object):
                                                               atom_indices_to_save=self._atom_selection_indices,
                                                               trajectory_filename=eq_traj_file)
 
-                #This task will follow the equilibrium task, and will consist of a nonequilibrium switching task
-                #along with another equilibrium task.
+                # This task will follow the equilibrium task, and will consist of a nonequilibrium switching task
+                # along with another equilibrium task.
                 neq_following_task = feptasks.run_protocol.s(self._hybrid_thermodynamic_states[lambda_state],
                                                              self._ne_mc_moves[lambda_state],
                                                              self._factory.hybrid_topology, self._n_iterations_per_call,
@@ -496,34 +539,34 @@ class NonequilibriumSwitchingFEP(object):
                                                              trajectory_filename=neq_traj_file)
 
                 eq_following_task = feptasks.run_equilibrium.s(self._hybrid_thermodynamic_states[lambda_state],
-                                                              self._equilibrium_mc_move, self._factory.hybrid_topology,
-                                                              n_iterations=self._n_iterations_per_call,
-                                                              atom_indices_to_save=self._atom_selection_indices,
-                                                              trajectory_filename=eq_traj_file)
+                                                               self._equilibrium_mc_move, self._factory.hybrid_topology,
+                                                               n_iterations=self._n_iterations_per_call,
+                                                               atom_indices_to_save=self._atom_selection_indices,
+                                                               trajectory_filename=eq_traj_file)
 
-                following_group = celery.group(feptasks.equilibrium_pass_through.s(), neq_following_task, eq_following_task)
+                following_group = celery.group(feptasks.equilibrium_pass_through.s(), neq_following_task,
+                                               eq_following_task)
 
-                #We'll chain the first equilibrium run to a pair of tasks: a nonequilibrium task and another equilibrium
-                #task.
+                # We'll chain the first equilibrium run to a pair of tasks: a nonequilibrium task and another equilibrium
+                # task.
                 iteration_chord = celery.chain(equilibrium_task, following_group)
 
                 iteration_chords[lambda_state] = iteration_chord
 
-            #call both chords to start lambda 0 and 1 calculations:
-            for lambda_state in [0,1]:
+            # call both chords to start lambda 0 and 1 calculations:
+            for lambda_state in [0, 1]:
                 iteration_results[lambda_state] = iteration_chords[lambda_state]()
 
-                #put the result in the task queue
+                # put the result in the task queue
 
-                task_dict = {'lambda_state' : lambda_state, 'iteration_number' : self._current_iteration, 'result_object' : iteration_results[lambda_state]}
+                task_dict = {'lambda_state': lambda_state, 'iteration_number': self._current_iteration,
+                             'result_object': iteration_results[lambda_state]}
                 self._task_queue.put(task_dict)
 
-                #set the sampler state for equilibrium to the latest equilibrium result:
+                # set the sampler state for equilibrium to the latest equilibrium result:
                 self._sampler_states[lambda_state] = iteration_results[lambda_state].children[2].get().sampler_state
 
-            self._current_iteration +=1
-
-
+            self._current_iteration += 1
 
     def _record_switching_results(self):
         """
@@ -532,59 +575,64 @@ class NonequilibriumSwitchingFEP(object):
         the information required to perturb to nonalchemical systems. It listens to a queue that was set up by the
         constructor, and waits for tasks to write out.
         """
-        #run until killed.
+        # run until killed.
         while True:
-            #this will be a dictionary. Just block until there's something here.
+            # this will be a dictionary. Just block until there's something here.
             task_dict = self._task_queue.get(block=True)
 
-            #acquire the lock:
+            # acquire the lock:
             work_lock.acquire()
 
-            #extract relevant information from the
+            # extract relevant information from the
             lambda_state = task_dict['lambda_state']
             iteration_number = task_dict['iteration_number']
             result_object = task_dict['result_object']
 
-            #the result object has three children, an equilibrium, nonequilibrium result and a following equilibrium result
+            # the result object has three children, an equilibrium, nonequilibrium result and a following equilibrium result
             initial_equilibrium_result = result_object.children[0].get()
             nonequilibrium_result = result_object.children[1].get()
             final_equilibrium_result = result_object.children[1].get()
 
             _logger.info("Received results for iteration %d and lambda endpoint %d" % (iteration_number, lambda_state))
 
-            #append the work value to our list
+            # append the work value to our list
             self._total_work[lambda_state].append(nonequilibrium_result.cumulative_work[-1])
 
-            #Get the reduced potential difference
+            # Get the reduced potential difference
 
-            #We'll need the thermodynamic state for the corresponding nonalchemical system:
+            # We'll need the thermodynamic state for the corresponding nonalchemical system:
             thermodynamic_state = self._nonalchemical_thermodynamic_states[lambda_state]
             reduced_potential_tasks = []
             for equilibrium_results in [initial_equilibrium_result, final_equilibrium_result]:
                 sampler_state = equilibrium_results.sampler_state
                 positions = sampler_state.positions
 
-                #convert the positions to the endpoint
+                # convert the positions to the endpoint
                 nonalchemical_positions = self._get_nonalchemical_positions(lambda_state, positions)
 
-                #construct a sampler state
-                nonalchemical_sampler_state = SamplerState(nonalchemical_positions, box_vectors=sampler_state.box_vectors)
+                # construct a sampler state
+                nonalchemical_sampler_state = SamplerState(nonalchemical_positions,
+                                                           box_vectors=sampler_state.box_vectors)
 
-                reduced_potential_tasks.append(feptasks.compute_reduced_potential.s(thermodynamic_state, nonalchemical_sampler_state))
+                reduced_potential_tasks.append(
+                    feptasks.compute_reduced_potential.s(thermodynamic_state, nonalchemical_sampler_state))
 
             reduced_potential_call = celery.group(reduced_potential_tasks)
 
-            #just block on getting these results
+            # just block on getting these results
             reduced_potential_result = reduced_potential_call().get()
 
-            #append the difference in results
+            # append the difference in results
             for result in reduced_potential_result:
-                self._reduced_potential_differences[lambda_state].append(initial_equilibrium_result.reduced_potential - result)
+                self._reduced_potential_differences[lambda_state].append(
+                    initial_equilibrium_result.reduced_potential - result)
 
-            #release the lock
+            # release the lock
             work_lock.release()
 
-            _logger.info("Computed reduced potential difference to nonalchemical system for iteration %d lambda state %d " % (iteration_number, lambda_state))
+            _logger.info(
+                "Computed reduced potential difference to nonalchemical system for iteration %d lambda state %d " % (
+                iteration_number, lambda_state))
 
     def _get_nonalchemical_positions(self, lambda_state: int, alchemical_positions: unit.Quantity):
         """
@@ -601,10 +649,10 @@ class NonequilibriumSwitchingFEP(object):
         nonalchemical_positions : unit.Quantity array
             nonalchemical positions at requested endpoint
         """
-        #convert these to the appropriate endpoint:
-        if lambda_state==0:
+        # convert these to the appropriate endpoint:
+        if lambda_state == 0:
             nonalchemical_positions = self._factory.old_positions(alchemical_positions)
-        elif lambda_state==1:
+        elif lambda_state == 1:
             nonalchemical_positions = self._factory.new_positions(alchemical_positions)
         else:
             raise ValueError("Only 0 or 1 are permitted for endpoints.")
@@ -650,11 +698,12 @@ class NonequilibriumSwitchingFEP(object):
             work_array = np.array(self._reduced_potential_differences[lambda_endpoint])
             burned_in, statistical_inefficiency, Neff_max = self._adjust_for_correlation(work_array)
 
-            _logger.info("Number of effective samples of endpoint pertubation at lambda %d is %f" % (lambda_endpoint, Neff_max))
+            _logger.info(
+                "Number of effective samples of endpoint pertubation at lambda %d is %f" % (lambda_endpoint, Neff_max))
 
             df, ddf_raw = pymbar.EXP(burned_in)
 
-            #correct by multiplying the stddev by the statistical inefficiency
+            # correct by multiplying the stddev by the statistical inefficiency
             ddf_corrected = ddf_raw * np.sqrt(statistical_inefficiency)
 
             free_energies.append([df, ddf_corrected])
@@ -684,12 +733,12 @@ class NonequilibriumSwitchingFEP(object):
 
             statistical_inefficiencies.append(statistical_inefficiency)
 
-        #for now we'll take the max of the two to decide how to report the error
+        # for now we'll take the max of the two to decide how to report the error
         statistical_inefficiency = max(statistical_inefficiencies)
 
         df, ddf_raw = pymbar.BAR(work_arrays[0], work_arrays[1])
 
-        ddf_corrected = ddf_raw*np.sqrt(statistical_inefficiency)
+        ddf_corrected = ddf_raw * np.sqrt(statistical_inefficiency)
 
         return df, ddf_corrected
 
@@ -698,7 +747,7 @@ class NonequilibriumSwitchingFEP(object):
         """
         Estimate the free energy based on currently available values
         """
-        #Make sure the task queue is empty (all pending calcs are complete) before computing free energy
+        # Make sure the task queue is empty (all pending calcs are complete) before computing free energy
         self._task_queue.join()
 
         [[df0, ddf0], [df1, ddf1]] = self._endpoint_perturbations()
@@ -706,25 +755,29 @@ class NonequilibriumSwitchingFEP(object):
 
         return -df0 + df + df1
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     import os
+
     _logger.setLevel(logging.INFO)
-    #gaff_filename = get_data_filename("data/gaff.xml")
-    #forcefield_files = [gaff_filename, 'tip3p.xml', 'amber99sbildn.xml']
-    #path_to_schrodinger_inputs = "/Users/grinawap/Downloads"
-    #protein_file = os.path.join(path_to_schrodinger_inputs, "/Users/grinawap/Downloads/CDK2_fixed_nohet.pdb")
-    #molecule_file = os.path.join(path_to_schrodinger_inputs, "/Users/grinawap/Downloads/Inputs_for_FEP/CDK2_ligands.mol2")
-    #fesetup = NonequilibriumFEPSetup(protein_file, molecule_file, 0, 2, forcefield_files)
-    import pickle
-    infile = open("fesetup2.pkl", 'rb')
-    fesetup = pickle.load(infile)
-    infile.close()
-    #pickle.dump(fesetup, outfile)
-    #outfile.close()
-    #outfile = open("fesetup2.pkl", 'wb')
-    #pickle.dump(fesetup, outfile)
-    #outfile.close()
-    ne_fep = NonequilibriumSwitchingFEP(fesetup.solvent_topology_proposal, fesetup.solvent_old_positions, fesetup.solvent_new_positions)
+    gaff_filename = get_data_filename("data/gaff.xml")
+    forcefield_files = [gaff_filename, 'tip3p.xml', 'amber99sbildn.xml']
+    # path_to_schrodinger_inputs = "/Users/grinawap/Downloads"
+    protein_file = "/Users/ballen/PycharmProjects/perses/CDK2_fixed_nohet.pdb"
+    molecule_file = "/Users/ballen/Downloads/Inputs_for_FEP/CDK2_ligands.mol2"
+    fesetup = NonequilibriumFEPSetup(protein_file, molecule_file, 14, 15, forcefield_files)
+    # import pickle
+
+    # infile = open("fesetup2.pkl", 'rb')
+    # fesetup = pickle.load(infile)
+    # infile.close()
+    # pickle.dump(fesetup, outfile)
+    # outfile.close()
+    # outfile = open("fesetup2.pkl", 'wb')
+    # pickle.dump(fesetup, outfile)
+    # outfile.close()
+    ne_fep = NonequilibriumSwitchingFEP(fesetup.solvent_topology_proposal, fesetup.solvent_old_positions,
+                                        fesetup.solvent_new_positions)
     print("ne-fep initialized")
     ne_fep.run(n_iterations=2)
     print(ne_fep.current_free_energy_estimate)

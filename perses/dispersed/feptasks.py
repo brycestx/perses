@@ -198,6 +198,9 @@ def run_protocol(equilibrium_result: EquilibriumResult, thermodynamic_state: sta
     for iteration in range(n_iterations):
         #apply the nonequilibrium move
         ne_mc_move.apply(thermodynamic_state, sampler_state)
+        print('Iteration %d | lambda = %.4f | cum_work = %.4f' % (iteration,
+                                                                  ne_mc_move._integrator.getGlobalVariableByName('lambda'),
+                                                                  ne_mc_move.current_total_work))
 
         #record the positions as a result
         trajectory_positions[iteration, :, :] = sampler_state.positions[atom_indices, :].value_in_unit_system(unit.md_unit_system)

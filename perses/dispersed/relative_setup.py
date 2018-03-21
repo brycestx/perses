@@ -469,7 +469,7 @@ class NonequilibriumSwitchingFEP(object):
                              1: AlchemicalNonequilibriumLangevinIntegrator(alchemical_functions=self._reverse_functions, nsteps_neq=ncmc_nsteps, temperature=temperature, splitting=self._splitting_string)}
 
         #create the forward and reverse MCMoves
-        self._ne_mc_moves = {n : NonequilibriumSwitchingMove(self._integrators[n], self._nsteps_per_iteration) for n in (0,1)}
+        self._ne_mc_moves = {n : NonequilibriumSwitchingMove(self._integrators[n], self._nsteps_per_iteration, n_restart_attempts=10) for n in (0,1)}
 
         #create the equilibrium MCMove
         self._equilibrium_mc_move = mcmc.LangevinSplittingDynamicsMove(n_steps=n_equil_steps)

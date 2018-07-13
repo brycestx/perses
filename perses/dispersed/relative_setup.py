@@ -187,7 +187,8 @@ class NonequilibriumFEPSetup(object):
                 barostat = None
             self._system_generator = SystemGenerator(forcefield_files, barostat=barostat,
                                                      forcefield_kwargs={'nonbondedMethod': self._nonbonded_method,
-                                                                        'constraints': app.HBonds})
+                                                                        'constraints': app.HBonds, 
+                                                                        'hydrogenMass': 4 * unit.amus})
         else:
             self._system_generator = SystemGenerator(forcefield_files, forcefield_kwargs={'constraints': app.HBonds})
 
@@ -865,21 +866,17 @@ class HybridSAMSSampler(HybridCompatibilityMixin, sams.SAMSSampler):
     def setup(self, n_states, temperature, storage_file, checkpoint_interval):
         hybrid_system = self._factory.hybrid_system
         initial_hybrid_positions = self._factory.hybrid_positions
-        alchemical_states = []
         lambda_zero_alchemical_state = alchemy.AlchemicalState.from_system(hybrid_system)
-        alchemical_states.append(lambda_zero_alchemical_state)
+        thermostate = states.ThermodynamicState(hybrid_system, temperature=temperature)
+        compound_state = states.CompoundThermodynamicState(thermostate, composable_states=[lambda_zero_alchemical_state])
 
+        thermodynamic_state_list = []
+        thermodynamic_state_list.append(compound_state)
         for idx in range(n_states):
             lambda_val = (1.0 + idx) / n_states
-            copied_state = copy.deepcopy(lambda_zero_alchemical_state)
+            copied_state = copy.deepcopy(compound_state)
             copied_state.set_alchemical_parameters(lambda_val)
-            alchemical_states.append(copied_state)
-
-        thermostate = states.ThermodynamicState(hybrid_system, temperature=temperature)
-        thermodynamic_state_list = []
-        for alchemical_state in alchemical_states:
-            thermodynamic_state_list.append(states.CompoundThermodynamicState(copy.deepcopy(thermostate),
-                                                                              composable_states=[alchemical_state]))
+            thermodynamic_state_list.append(copied_state)
 
         nonalchemical_thermodynamic_states = [
             states.ThermodynamicState(self._factory._old_system, temperature=temperature),
@@ -953,7 +950,7 @@ def run_setup(setup_options):
     try:
         atom_map_file = setup_options['atom_map']
         with open(atom_map_file, 'r') as f:
-            atom_map = {int(x.split()[0]): int(x.split()[1]) for x in f.readlines()}
+            atom_map = {int(x.split()[0])-1: int(x.split()[1])-1 for x in f.readlines()}
     except Exception:
         atom_map=None
 
@@ -1026,15 +1023,16 @@ def run_setup(setup_options):
                                                top_prop['%s_old_positions' % phase],
                                                top_prop['%s_new_positions' % phase])
 
-            hss[phase] = HybridSAMSSampler(mcmc_moves=mcmc.LangevinDynamicsMove(timestep=2.0 * unit.femtosecond,
+            hss[phase] = HybridSAMSSampler(mcmc_moves=mcmc.LangevinSplittingDynamicsMove(timestep=4.0 * unit.femtosecond,
                                                                                 collision_rate=5.0 / unit.picosecond,
                                                                                 n_steps=n_steps_per_move_application,
                                                                                 reassign_velocities=False,
-                                                                                n_restart_attempts=6),
-                                           hybrid_factory=htf[phase])
+                                                                                n_restart_attempts=6, 
+                                                                                splitting="V R R R O R R R V"),
+                                           hybrid_factory=htf[phase], online_analysis_interval=10)
             hss[phase].setup(n_states=n_states, temperature=300.0 * unit.kelvin,
                              storage_file=os.path.join(trajectory_directory, '-'.join([trajectory_prefix, '%s.nc'
                                                                                        % phase])),
-                             checkpoint_interval=1)
+                             checkpoint_interval=100)
 
         return {'topology_proposals': top_prop, 'hybrid_topology_factories': htf, 'hybrid_sams_samplers': hss}

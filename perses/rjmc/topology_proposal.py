@@ -1841,7 +1841,7 @@ class TwoMoleculeSetProposalEngine(SmallMoleculeSetProposalEngine):
 
         super(TwoMoleculeSetProposalEngine, self).__init__([self._old_mol_smiles, self._new_mol_smiles], system_generator, residue_name=residue_name, atom_expr=atom_expr, bond_expr=bond_expr, atom_map=atom_map)
 
-        self._allow_ring_breaking = False # don't allow ring breaking
+        self._allow_ring_breaking = True # don't allow ring breaking
 
     def _propose_molecule(self, system, topology, molecule_smiles, exclude_self=False):
         return self._new_mol_smiles, self._new_mol, 0.0
